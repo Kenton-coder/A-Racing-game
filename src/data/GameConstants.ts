@@ -44,7 +44,7 @@ export const STR = {
   MENU_TITLE:           '澳門格蘭披治賽車',
   MENU_START:           '開始遊戲',
   MENU_LEADERBOARD:     '排行榜',
-  MENU_SETTINGS:        '設定',
+  MENU_SETTINGS:        '規則',
 
   // 賽前設置
   SETUP_TITLE:          '賽前設置',
