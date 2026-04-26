@@ -1,0 +1,688 @@
+// [版本] v0.6 | [日期] 2026-04-22 | [功能] 修復完圈與結束提示重疊（Issue 4）
+
+import Phaser from 'phaser';
+import { GuiaCircuitData } from '@/track/GuiaCircuitData';
+import { TrackSplineGenerator } from '@/track/TrackSplineGenerator';
+import { CheckpointManager } from '@/systems/CheckpointManager';
+import { RaceTimer } from '@/systems/RaceTimer';
+import { LapRecorder } from '@/systems/LapRecorder';
+import { RaceStandings } from '@/systems/RaceStandings';
+import { VehiclePhysics } from '@/vehicle/VehiclePhysics';
+import { PlayerInputController } from '@/vehicle/PlayerInputController';
+import { AIWaypointAgent, AIDifficulty } from '@/vehicle/AIWaypointAgent';
+import { VehicleConfig, VehicleConfigManager } from '@/data/VehicleConfig';
+import { RaceSetup, DEFAULT_RACE_SETUP } from '@/data/RaceSetup';
+import { EventBus } from '@/utils/EventBus';
+import { HUDController } from '@/ui/HUDController';
+import { PauseMenu } from '@/ui/PauseMenu';
+import {
+  SCENE, ASSET, PHYSICS,
+  COLOR_DARK, COLOR_WHITE, COLOR_GREEN, COLOR_GOLD, COLOR_RED,
+  GameState, RacingMode, VehicleType,
+  STR,
+} from '@/data/GameConstants';
+import { EVENT_LAP_COMPLETED } from '@/systems/CheckpointManager';
+
+// ── 修正後的世界座標常量 ────────────────────────────────────────────────────────────── 
+// 我們將邊界擴大，並調整偏移量讓 (0,0) 靠近中央
+const WORLD_OFFSET_X = 6000; // 增加偏移量，防止座標出現負數時超出邊界
+const WORLD_OFFSET_Y = 4000; 
+const WORLD_W        = 15000; // 將寬度擴大至 15,000 像素
+const WORLD_H        = 10000; // 將高度擴大至 10,000 像素
+const CP_COUNT       = 20; 
+const PLAYER_ID      = 'player'; 
+const ROAD_WIDTH     = 140;
+
+// ── 預設車輛配置（JSON 載入失敗時的備援） ────────────────────────────────────
+const DEFAULT_PLAYER_CFG: VehicleConfig = {
+  id: 'f3_default', type: VehicleType.F3, modes: [RacingMode.TIME_TRIAL, RacingMode.RACE],
+  displayName: 'F3', mass: 600, maxSpeed: 220,
+  acceleration: 15, braking: 0.90, handling: 120, grip: 0.9,
+  hitbox: { width: 20, height: 40 }, textureKey: ASSET.CAR_PLAYER,
+  spritePath: 'assets/sprites/car_player.png',
+};
+
+const DEFAULT_AI_CFG: VehicleConfig = {
+  id: 'ai_default', type: VehicleType.F3, modes: [RacingMode.RACE],
+  displayName: 'AI', mass: 600, maxSpeed: 210,
+  acceleration: 14, braking: 0.88, handling: 110, grip: 0.88,
+  hitbox: { width: 20, height: 40 }, textureKey: ASSET.CAR_AI_1,
+  spritePath: 'assets/sprites/car_ai_1.png',
+};
+
+export class RaceScene extends Phaser.Scene {
+  // ── 系統 ──────────────────────────────────────────────────────────────────
+  private _raceSetup!: RaceSetup;
+  private _checkpointManager!: CheckpointManager;
+  private _raceTimer!: RaceTimer;
+  private _lapRecorder!: LapRecorder;
+  private _raceStandings!: RaceStandings;
+
+  // ── 玩家 ──────────────────────────────────────────────────────────────────
+  private _playerSprite!: Phaser.Physics.Matter.Sprite;
+  private _playerPhysics!: VehiclePhysics;
+  private _playerInput!: PlayerInputController;
+  private _playerCfg!: VehicleConfig;
+
+  // ── AI ────────────────────────────────────────────────────────────────────
+  private _aiSprites: Phaser.Physics.Matter.Sprite[] = [];
+  private _aiPhysics: VehiclePhysics[] = [];
+  private _aiAgents: AIWaypointAgent[] = [];
+
+  // ── 賽道 ──────────────────────────────────────────────────────────────────
+  private _splinePoints!: { x: number; y: number }[];
+  private _pxWaypoints!: { x: number; y: number }[];
+
+  // ── 狀態 ──────────────────────────────────────────────────────────────────
+  private _gameState: GameState = GameState.IDLE;
+  private _finishedVehicles: Set<string> = new Set();
+
+  // ── UI ────────────────────────────────────────────────────────────────────
+  private _hud!: HUDController;
+  private _pauseMenu!: PauseMenu;
+  private _txtCountdown!: Phaser.GameObjects.Text;
+
+  // 各車型的所有可用顏色 key（不含前綴，如 'red'）───────────────────────────────
+  private static readonly F3_COLORS = ['black','blue','green','grey','lightgray','orange','red','whitegray','white','yellow'];
+  private static readonly GT_COLORS = ['black','blue','green','red','yellow']; // 用於 GT3、Sedan
+  private static readonly BIKE_COLORS = ['black','blue','green','red','yellow'];
+
+  constructor() {
+    super(SCENE.RACE);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  create
+  // ────────────────────────────────────────────────────────────────────────────
+
+  create(): void {
+    this.input.on('gameobjectdown', () => { this.sound.play(ASSET.SFX_UI_CLICK, { volume: 0.8 }); });
+
+    this._raceSetup = (this.registry.get('raceSetup') as RaceSetup | undefined) ?? DEFAULT_RACE_SETUP;
+
+    // 1. 設定 Matter.js 物理世界的邊界
+    this.matter.world.setBounds(-WORLD_OFFSET_X, -WORLD_OFFSET_Y, WORLD_W, WORLD_H);
+
+    // 2. 同時設定主相機的移動限制
+    this.cameras.main.setBounds(-WORLD_OFFSET_X, -WORLD_OFFSET_Y, WORLD_W, WORLD_H);
+
+    this._loadVehicleConfigs();
+
+    // 路點像素化（公尺 → px）。目前維持原始 Unity 座標（未做 X/Y 翻轉）。
+    this._pxWaypoints = GuiaCircuitData.Waypoints.map(p => ({
+      x: p.x * PHYSICS.PIXELS_PER_METER + WORLD_OFFSET_X,
+      y: p.y * PHYSICS.PIXELS_PER_METER + WORLD_OFFSET_Y,
+    }));
+
+    // 樣條插值
+    const gen = new TrackSplineGenerator(this._pxWaypoints);
+    this._splinePoints = gen.generateSpline(20);
+
+    // 世界 / 相機邊界
+    this.cameras.main.setBounds(0, 0, WORLD_W, WORLD_H);
+    this.matter.world.setBounds(0, 0, WORLD_W, WORLD_H);
+
+    // 繪製賽道
+    this._drawTrack();
+
+    // 建立車輛
+    this._createVehicles();
+
+    // 建立 Checkpoint（純 Zone，手動 overlap 偵測）
+    this._checkpointManager = new CheckpointManager(this, this._raceSetup.totalLaps);
+    const cpZones = this._checkpointManager.buildCheckpoints(
+      this._splinePoints, CP_COUNT, 160, 50,
+    );
+
+    // Matter 撞牆音效 + 震動
+    this.matter.world.on('collisionstart', (event: { pairs: { bodyA: MatterJS.BodyType; bodyB: MatterJS.BodyType }[] }) => {
+      event.pairs.forEach(pair => {
+        const isWallA = pair.bodyA.label === 'wall';
+        const isWallB = pair.bodyB.label === 'wall';
+        if (isWallA || isWallB) {
+          // 只有玩家車輛碰撞牆壁時才震動相機
+          const other = isWallA ? pair.bodyB : pair.bodyA;
+          if (other.gameObject === this._playerSprite) {
+            this.cameras.main.shake(80, 0.005);
+          }
+        }
+      });
+    });
+
+    // 計時 / 記錄 / 排名 系統初始化
+    this._raceTimer    = new RaceTimer();
+    this._lapRecorder  = new LapRecorder();
+    this._raceStandings = new RaceStandings();
+
+    this._checkpointManager.registerVehicle(PLAYER_ID);
+    this._lapRecorder.registerVehicle(PLAYER_ID);
+    this._raceStandings.register(PLAYER_ID);
+
+    this._aiSprites.forEach((_, i) => {
+      const id = `ai_${i}`;
+      this._checkpointManager.registerVehicle(id);
+      this._lapRecorder.registerVehicle(id);
+      this._raceStandings.register(id);
+    });
+
+    // 相機跟隨玩家
+    this.cameras.main.startFollow(this._playerSprite, true, 0.1, 0.1);
+    this.cameras.main.setZoom(1.4);
+
+    // 事件
+    this._setupEvents();
+
+    // HUD（左上角時間/圈數、右上角排名、右下角速度）
+    this._hud = new HUDController(this, this._raceSetup.totalLaps);
+
+    // 主相機 setZoom(1.4) 以畫面中心為原點縮放，造成 scrollFactor(0) 元素偏移到角落外
+    // 解法：加入 zoom=1 的 UI Camera（世界物件在 x≥5000，不會出現在此 camera 的視野內）
+    //       主相機不渲染 HUD，UI Camera 在正確位置渲染 HUD
+    const { width: uiW, height: uiH } = this.scale;
+    this.cameras.add(0, 0, uiW, uiH);                    // uiCam: zoom=1, scroll=0
+    this.cameras.main.ignore(this._hud.getElements());
+
+    // 暫停選單（每個元素直接在場景，setScrollFactor(0)）
+    this._pauseMenu = new PauseMenu(this, () => this._setPaused(false));
+
+    // 倒計時開始
+    this._startCountdown();
+
+    // 隱藏 Checkpoint 輔助（可在 debug 模式改為顯示）
+    cpZones.forEach(z => z.setVisible(false));
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  update
+  // ────────────────────────────────────────────────────────────────────────────
+
+  override update(_time: number, delta: number): void {
+    if (this._gameState === GameState.RACING) {
+      const input = this._playerInput.getInput();
+      this._playerPhysics.update(delta, input);
+
+      this._aiSprites.forEach((sprite, i) => {
+        const aiInput = this._aiAgents[i].getInput(
+          sprite,
+          this._aiPhysics[i].getCurrentSpeedPx()
+        );
+        this._aiPhysics[i].update(delta, aiInput);
+
+        // ── AI 強制重置（卡住超過 3 秒） ──
+        if (this._aiAgents[i].needsRespawn()) {
+          const info = this._aiAgents[i].consumeRespawn();
+          if (info) {
+            this._aiSprites[i].setPosition(info.x, info.y);
+            this._aiPhysics[i].setRotation(info.angle);
+            this._aiPhysics[i].reset();
+          }
+      }
+      
+      });
+
+      const vehicles = [
+        { id: PLAYER_ID, x: this._playerSprite.x, y: this._playerSprite.y },
+        ...this._aiSprites.map((s, i) => ({ id: `ai_${i}`, x: s.x, y: s.y })),
+      ];
+      this._checkpointManager.update(delta, vehicles);
+      this._raceTimer.update(delta);
+      this._updateStandings();
+      this._refreshHUD();
+
+      if (this._playerInput.isPauseJustPressed()) {
+        this._setPaused(true);
+      }
+
+    } else if (this._gameState === GameState.PAUSED) {
+      if (this._playerInput.isPauseJustPressed()) {
+        this._setPaused(false);
+      }
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  Private – setup
+  // ────────────────────────────────────────────────────────────────────────────
+
+  private _loadVehicleConfigs(): void {
+    try {
+      const json = this.cache.json.get(ASSET.VEHICLE_CONFIGS) as VehicleConfig[] | null;
+      if (json && json.length > 0) {
+        VehicleConfigManager.loadConfigs(json);
+      }
+    } catch (_e) {
+      console.warn('[RaceScene] vehicle_configs.json 載入失敗，使用預設配置');
+    }
+
+    this._playerCfg =
+      VehicleConfigManager.getConfig(this._raceSetup.vehicleId) ?? DEFAULT_PLAYER_CFG;
+  }
+
+  private _drawTrack(): void {
+    const gfx = this.add.graphics();
+    gfx.setDepth(0);
+
+    // 路面（深色）
+    gfx.lineStyle(ROAD_WIDTH, COLOR_DARK, 1);
+    gfx.beginPath();
+    gfx.moveTo(this._splinePoints[0].x, this._splinePoints[0].y);
+    for (let i = 1; i < this._splinePoints.length; i++) {
+      gfx.lineTo(this._splinePoints[i].x, this._splinePoints[i].y);
+    }
+    gfx.closePath();
+    gfx.strokePath();
+
+    // 路肩（左右兩側交替紅白）—— 獨立 Graphics 物件確保 depth 高於起跑線
+    const kerbGfx = this.add.graphics();
+    kerbGfx.setDepth(2);
+    const KERB_WIDTH   = 9;
+    const KERB_OFFSET  = ROAD_WIDTH / 2;  // 路面邊緣
+
+    for (let i = 0; i < this._splinePoints.length - 1; i++) {
+      const a = this._splinePoints[i];
+      const b = this._splinePoints[i + 1];
+
+      const dx  = b.x - a.x;
+      const dy  = b.y - a.y;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 0.001) continue;
+
+      // 法向量（垂直於切線）
+      const nx = -dy / len;
+      const ny =  dx / len;
+
+      const color = (Math.floor(i / 4) % 2 === 0) ? COLOR_RED : COLOR_WHITE;
+      kerbGfx.lineStyle(KERB_WIDTH, color, 0.95);
+
+      // 左側路肩
+      kerbGfx.beginPath();
+      kerbGfx.moveTo(a.x + nx * KERB_OFFSET, a.y + ny * KERB_OFFSET);
+      kerbGfx.lineTo(b.x + nx * KERB_OFFSET, b.y + ny * KERB_OFFSET);
+      kerbGfx.strokePath();
+
+      // 右側路肩
+      kerbGfx.beginPath();
+      kerbGfx.moveTo(a.x - nx * KERB_OFFSET, a.y - ny * KERB_OFFSET);
+      kerbGfx.lineTo(b.x - nx * KERB_OFFSET, b.y - ny * KERB_OFFSET);
+      kerbGfx.strokePath();
+    }
+
+    // 中心白虛線（每隔 10 個點畫一段）
+    gfx.lineStyle(3, COLOR_WHITE, 0.5);
+    for (let i = 0; i < this._splinePoints.length - 1; i += 10) {
+      const a = this._splinePoints[i];
+      const b = this._splinePoints[Math.min(i + 5, this._splinePoints.length - 1)];
+      gfx.beginPath();
+      gfx.moveTo(a.x, a.y);
+      gfx.lineTo(b.x, b.y);
+      gfx.strokePath();
+    }
+
+    // 起點/終點線（黑白棋盤格，與賽道垂直）
+    const p0         = this._pxWaypoints[0];
+    const p1         = this._pxWaypoints[1];
+    const trackAngle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+    const CELL       = 12;
+    const HALF_W     = ROAD_WIDTH / 2 + 4;
+    const COLS       = Math.ceil(HALF_W * 2 / CELL);
+    const ROWS       = 3;
+    const startGfx   = this.add.graphics();
+    startGfx.setPosition(p0.x, p0.y);
+    startGfx.setRotation(trackAngle + Math.PI / 2);
+    startGfx.setDepth(1);
+    for (let c = 0; c < COLS; c++) {
+      for (let r = 0; r < ROWS; r++) {
+        startGfx.fillStyle((c + r) % 2 === 0 ? 0x000000 : 0xFFFFFF, 1);
+        startGfx.fillRect(-HALF_W + c * CELL, -ROWS * CELL / 2 + r * CELL, CELL, CELL);
+      }
+    }
+    
+    // Matter 靜態邊牆（每 4 個樣條點取一段，左右各一條）
+    const halfW    = ROAD_WIDTH / 2;
+    const wallOpts = { isStatic: true, label: 'wall', friction: 0.0, frictionStatic: 0.0, restitution: 0.0 };
+    for (let i = 0; i < this._splinePoints.length - 1; i += 1) {
+      const p1    = this._splinePoints[i];
+      const p2    = this._splinePoints[Math.min(i + 1, this._splinePoints.length - 1)];
+      const dist  = Phaser.Math.Distance.Between(p1.x, p1.y, p2.x, p2.y);
+      const angle = Phaser.Math.Angle.Between(p1.x, p1.y, p2.x, p2.y);
+      const nx    = Math.cos(angle + Math.PI / 2);
+      const ny    = Math.sin(angle + Math.PI / 2);
+      const cx    = (p1.x + p2.x) / 2;
+      const cy    = (p1.y + p2.y) / 2;
+      this.matter.add.rectangle(cx + nx * halfW, cy + ny * halfW, dist + 4, 8, { ...wallOpts, angle });
+      this.matter.add.rectangle(cx - nx * halfW, cy - ny * halfW, dist + 4, 8, { ...wallOpts, angle });
+    }
+  }
+
+  private _createVehicles(): void {
+    const wp0 = this._pxWaypoints[0];
+    const wp1 = this._pxWaypoints[1];
+
+    // 賽道前進方向與側向單位向量
+    const fwdLen   = Math.hypot(wp1.x - wp0.x, wp1.y - wp0.y);
+    const fwdX     = (wp1.x - wp0.x) / fwdLen;
+    const fwdY     = (wp1.y - wp0.y) / fwdLen;
+    const latX     = -fwdY;
+    const latY     =  fwdX;
+    const fwdAngle = Math.atan2(wp1.y - wp0.y, wp1.x - wp0.x) - Math.PI / 2;
+
+    // 發車格：slot 0 = 玩家（最前排中央），slot 1+ = AI 左右交替排列
+    const BEHIND   = 80;
+    const ROW_GAP  = 60;
+    const SIDE_GAP = 32;
+    const gridPos = (slot: number): { x: number; y: number } => {
+      const row  = slot === 0 ? 0 : Math.floor((slot - 1) / 2) + 1;
+      const side = slot === 0 ? 0 : (slot % 2 === 1 ? 1 : -1);
+      return {
+        x: wp0.x - fwdX * (BEHIND + row * ROW_GAP) + latX * side * SIDE_GAP,
+        y: wp0.y - fwdY * (BEHIND + row * ROW_GAP) + latY * side * SIDE_GAP,
+      };
+    };
+
+    // ── 玩家 ──
+    const isBike       = this._raceSetup.vehicleType === VehicleType.BIKE;
+    const playerTexKey = this._raceSetup.vehicleId;  // 動態讀取，對應 BootScene load key
+    const pW           = isBike ? 18 : 28;
+    const pH           = isBike ? 40 : 52;
+    const { x: pX, y: pY } = gridPos(0);
+
+    this._playerSprite = this.matter.add.sprite(pX, pY, playerTexKey);
+    // 車頭向下素材需垂直翻轉（只有 F3 有這個特性）
+    if (this._raceSetup.vehicleType === VehicleType.F3) {
+      this._playerSprite.setFlipY(true);
+    }
+    this._playerSprite.setDisplaySize(pW, pH);
+    this._playerSprite.setBody({ type: 'rectangle', width: pW, height: pH });
+    this._playerSprite.setDepth(10);
+    (this._playerSprite as unknown as { vehicleId: string }).vehicleId = PLAYER_ID;
+
+    this._playerPhysics = new VehiclePhysics(this._playerSprite, this._playerCfg);
+    this._playerInput   = new PlayerInputController(this);
+    this._playerPhysics.setRotation(fwdAngle);
+
+    // ── AI（僅 RACE 模式） ──
+    if (this._raceSetup.mode === RacingMode.RACE) {
+      const count     = Math.min(this._raceSetup.aiCount, 5);
+      const isAiBike  = this._raceSetup.aiVehicleClass === VehicleType.BIKE;
+      const aiW       = isAiBike ? 18 : 28;
+      const aiH       = isAiBike ? 40 : 52;
+      // 建立 AI agents，初始位置由 gridPos 提供
+      this._aiAgents = [];
+      for (let i = 0; i < count; i++) {
+        const { x: aiX, y: aiY } = gridPos(i + 1);
+        const agent = new AIWaypointAgent(
+          this._pxWaypoints,
+          AIDifficulty.NORMAL,
+          0,
+          { x: aiX, y: aiY }
+        );
+        this._aiAgents.push(agent);
+      }
+
+      for (let i = 0; i < count; i++) {
+        const { x: aiX, y: aiY } = gridPos(i + 1);
+        // 每輛 AI 隨機選色，排除玩家色
+        const aiKey = this._getRandomAiColorKey(
+          this._raceSetup.aiVehicleClass,
+          this._raceSetup.playerColor
+        );
+
+        const aiSprite = this.matter.add.sprite(aiX, aiY, aiKey);
+        aiSprite.setDisplaySize(aiW, aiH);
+        aiSprite.setBody({ type: 'rectangle', width: aiW, height: aiH });
+        aiSprite.setDepth(10);
+        (aiSprite as unknown as { vehicleId: string }).vehicleId = `ai_${i}`;
+
+        const aiPhysics = new VehiclePhysics(aiSprite, DEFAULT_AI_CFG);
+        aiPhysics.setRotation(fwdAngle);
+
+        // F3 需翻轉（AI 同理）
+        if (this._raceSetup.aiVehicleClass === VehicleType.F3) {
+          aiSprite.setFlipY(true);
+        }
+
+        this._aiSprites.push(aiSprite);
+        this._aiPhysics.push(aiPhysics);
+      }
+    }
+  }
+
+  private _setupEvents(): void {
+    EventBus.on(EVENT_LAP_COMPLETED, this._onLapCompleted, this);
+    EventBus.on('onRaceFinished',    this._onRaceFinished,  this);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, this._onShutdown, this);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  Private – countdown
+  // ────────────────────────────────────────────────────────────────────────────
+
+  private _startCountdown(): void {
+    this._gameState = GameState.COUNTDOWN;
+    const { width, height } = this.scale;
+
+    this._txtCountdown = this.add
+      .text(width / 2, height / 2, '3', {
+        fontSize: '120px', fontFamily: 'monospace',
+        color: `#${COLOR_GOLD.toString(16).padStart(6, '0')}`,
+        stroke: '#000000', strokeThickness: 8,
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(100);
+    this.cameras.main.ignore(this._txtCountdown);
+
+    // 播放倒數音效
+    this.sound.play(ASSET.SFX_COUNTDOWN, { volume: 0.8 });
+
+    const steps = ['3', '2', '1', STR.COUNTDOWN_GO];
+    let step = 0;
+
+    const tick = (): void => {
+      step++;
+      if (step < steps.length) {
+        this._txtCountdown.setText(steps[step]);
+        if (step === steps.length - 1) {
+          this._txtCountdown.setColor(`#${COLOR_GREEN.toString(16).padStart(6, '0')}`);
+          this.time.delayedCall(600, () => {
+            this._txtCountdown.destroy();
+            this._startRace();
+          });
+        } else {
+          this.time.delayedCall(1000, tick);
+        }
+      }
+    };
+
+    this.time.delayedCall(1000, tick);
+  }
+
+  private _startRace(): void {
+    this._gameState = GameState.RACING;
+    this._raceTimer.start();
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  Private – HUD
+  // ────────────────────────────────────────────────────────────────────────────
+
+  private _refreshHUD(): void {
+    const lap = Math.min(
+      this._lapRecorder.getLapCount(PLAYER_ID) + 1,
+      this._raceSetup.totalLaps,
+    );
+    this._hud.updateHUD(
+      this._playerPhysics.getCurrentSpeedKmh(),
+      this._raceTimer.getTotalMs(),
+      lap,
+      this._raceSetup.totalLaps,
+      this._raceStandings.getPosition(PLAYER_ID),
+    );
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  Private – pause
+  // ────────────────────────────────────────────────────────────────────────────
+
+  private _setPaused(paused: boolean): void {
+    this._gameState = paused ? GameState.PAUSED : GameState.RACING;
+    if (paused) {
+      this._pauseMenu.show();
+      this._hud.setVisible(false);
+      this.matter.world.enabled = false;
+    } else {
+      this._pauseMenu.hide();
+      this._hud.setVisible(true);
+      this.matter.world.enabled = true;
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  Private – standings + events
+  // ────────────────────────────────────────────────────────────────────────────
+
+  private _updateStandings(): void {
+    const totalCP = this._checkpointManager.checkpointCount;
+
+    // ── 輔助：計算車輛的進度值（圈數 + 檢查點區間完成比例） ──
+    const calcProgress = (id: string, _laps: number, nextCP: number): number => {
+      if (_laps >= this._raceSetup.totalLaps) return 1;   // 已完成全部圈數，進度直接滿
+      const prevCP = (nextCP - 1 + totalCP) % totalCP;
+      const pos = id === PLAYER_ID
+        ? { x: this._playerSprite.x, y: this._playerSprite.y }
+        : (() => {
+            const idx = parseInt(id.split('_')[1]);
+            return { x: this._aiSprites[idx].x, y: this._aiSprites[idx].y };
+          })();
+
+      const prev = this._checkpointManager.getCheckpointPosition(prevCP);
+      const next = this._checkpointManager.getCheckpointPosition(nextCP);
+      if (!prev || !next) return 0;
+
+      const dx = next.x - prev.x;
+      const dy = next.y - prev.y;
+      const segLen = Math.sqrt(dx * dx + dy * dy);
+      if (segLen < 0.001) return 0;
+
+      const vx = pos.x - prev.x;
+      const vy = pos.y - prev.y;
+      // 投影比例 (0~1)，clamp 避免超出範圍
+      const t = Phaser.Math.Clamp((vx * dx + vy * dy) / (segLen * segLen), 0, 1);
+      return t; // 0~1
+    };
+
+    const pLaps = this._checkpointManager.getLapsCompleted(PLAYER_ID);
+    const pNext = this._checkpointManager.getNextCheckpoint(PLAYER_ID);
+    const pProg = calcProgress(PLAYER_ID, pLaps, pNext);
+    this._raceStandings.update(PLAYER_ID, pLaps, pNext, pProg);
+
+    this._aiSprites.forEach((_, i) => {
+      const id = `ai_${i}`;
+      const al = this._checkpointManager.getLapsCompleted(id);
+      const an = this._checkpointManager.getNextCheckpoint(id);
+      const ap = calcProgress(id, al, an);
+      this._raceStandings.update(id, al, an, ap);
+    });
+  }
+
+  private _onLapCompleted(vehicleId: string, lapNum: number): void {
+    if (vehicleId === PLAYER_ID) {
+      const lapMs = this._raceTimer.recordLap();
+      this._lapRecorder.record(PLAYER_ID, lapMs);
+      this._showMessage(
+        `圈 ${lapNum} 完成！${STR.HUD_BEST_LAP}: ${RaceTimer.format(lapMs)}`, 2500,
+      );
+    } else {
+      this._lapRecorder.record(vehicleId, 0);
+    }
+  }
+
+  private _onRaceFinished(vehicleId: string): void {
+    if (this._finishedVehicles.has(vehicleId)) return;
+    this._finishedVehicles.add(vehicleId);
+
+    if (vehicleId !== PLAYER_ID) return;
+
+    this._gameState = GameState.FINISHED;
+    this._raceTimer.stop();
+
+    // 播放比賽結束音效
+    this.sound.play(ASSET.SFX_FINISH, { volume: 0.8 });
+
+
+    this._showMessage(`🏁 ${STR.RESULTS_TITLE}！`, 0, this.scale.height * 0.47);
+
+    this._updateStandings();  // 刷新排名，確保拿到最新名次
+
+    // 儲存結算資料並在 3 秒後進入 ResultsScene
+    const resultData = {
+      totalMs:   this._raceTimer.getTotalMs(),
+      bestLapMs: this._lapRecorder.getBestLap(PLAYER_ID),
+      lapTimes:  this._lapRecorder.getLapTimes(PLAYER_ID),
+      position:  this._raceStandings.getPosition(PLAYER_ID),
+      raceSetup: this._raceSetup,
+    };
+    this.registry.set('raceResult', resultData);
+
+    this.time.delayedCall(3000, () => {
+      this.scene.start(SCENE.RESULTS);
+    });
+  }
+
+  private _showMessage(text: string, durationMs: number, yPosition?: number): void {
+    const { width, height } = this.scale;
+    const yPos = yPosition ?? height * 0.35;
+    const msg = this.add.text(width / 2, yPos, text, {
+      fontSize: '28px', fontFamily: 'monospace',
+      color: `#${COLOR_GOLD.toString(16).padStart(6, '0')}`,
+      stroke: '#000', strokeThickness: 6,
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(90);
+    this.cameras.main.ignore(msg);
+
+    if (durationMs > 0) {
+      this.time.delayedCall(durationMs, () => msg.destroy());
+    }
+  }
+
+  /**
+   * 為 AI 隨機選一個與玩家不重複的貼圖 key
+   * @param vehicleClass 車輛類型
+   * @param playerColor 玩家選擇的顏色 (不含前綴)
+   * @returns 貼圖 key，例如 'f3_blue'
+   */
+  private _getRandomAiColorKey(vehicleClass: VehicleType, playerColor: string): string {
+    let pool: string[];
+    let prefix: string;
+    if (vehicleClass === VehicleType.F3) {
+      pool = RaceScene.F3_COLORS;
+      prefix = 'f3';
+    } else if (vehicleClass === VehicleType.GT3) {
+      pool = RaceScene.GT_COLORS;
+      prefix = 'gt3';
+    } else if (vehicleClass === VehicleType.SEDAN) {
+      pool = RaceScene.GT_COLORS;
+      prefix = 'sedan';
+    } else { // BIKE
+      pool = RaceScene.BIKE_COLORS;
+      prefix = 'bike';
+    }
+
+    // 過濾掉玩家使用的顏色
+    const available = pool.filter(c => c !== playerColor);
+    if (available.length === 0) {
+      // 理論上不會發生，但若發生則直接使用玩家色（仍有風險）
+      return `${prefix}_${playerColor}`;
+    }
+    const color = Phaser.Math.RND.pick(available);
+    return `${prefix}_${color}`;
+  }
+
+  private _onShutdown(): void {
+    EventBus.off(EVENT_LAP_COMPLETED, this._onLapCompleted, this);
+    EventBus.off('onRaceFinished',    this._onRaceFinished,  this);
+    this._playerInput.destroy();
+    this._hud.destroy();
+    this._pauseMenu.destroy();
+  }
+
+}
